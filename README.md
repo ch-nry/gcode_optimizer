@@ -101,7 +101,7 @@ Toolpath simulations clearly show the improvement:
 
 | Original | Optimized (simple) | Optimized (-r) |
 |----------|-------------------|----------------|
-| ![Original](decoupe.png) | ![Optimized 1](decoupe_optimized.png) | ![Optimized 2](decoupe_optimized_with-r.png) |
+| ![Original](decoupe.png) | ![Optimized 1](decoupe_optimized.png) | ![Optimized 2](decoupe_optimized_with_-r.png) |
 
 ## 🔧 How It Works
 
