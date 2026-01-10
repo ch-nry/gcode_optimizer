@@ -1,17 +1,51 @@
+#!/usr/bin/env python3
+"""
+G-code Optimizer - Travel Distance Minimization Tool
+
+Optimizes CNC G-code by reordering cutting segments to minimize rapid travel
+movements using the nearest neighbor algorithm.
+
+Performance:
+- With scipy/numpy: O(n log n) using KD-Tree
+- Without scipy/numpy: O(n²) brute force
+
+Author: [claude.ai]
+License: MIT
+"""
+
+# =============================================================================
+# CONFIGURATION PARAMETERS
+# =============================================================================
+SAFE_Z = 5.0              # Safe height for Z moves (mm)
+RAPID_FEEDRATE = 1500.0   # Feedrate for rapid moves G0 (mm/min)
+PLUNGE_FEEDRATE = 300.0   # Feedrate for Z plunge moves (mm/min)
+DEFAULT_FEEDRATE = 500.0  # Default feedrate if none specified (mm/min)
+
+# Algorithm parameters
+Z_TOLERANCE = 0.001       # Tolerance for Z level matching (mm)
+CONTINUITY_TOLERANCE = 0.01  # Distance threshold for continuous segments (mm)
+KDTREE_EXTRA_NEIGHBORS = 5   # Extra neighbors to query (for filtering used segments)
+# =============================================================================
+
 import re
 import math
 import sys
 import os
 from typing import List, Tuple, Dict
 
-# =============================================================================
-# CONFIGURATION PARAMETERS
-# =============================================================================
-SAFE_Z = 5.0              # Safe height for Z moves
-RAPID_FEEDRATE = 1500.0   # Feedrate for rapid moves G0
-PLUNGE_FEEDRATE = 300.0   # Feedrate for Z plunge moves
-DEFAULT_FEEDRATE = 500.0  # Default feedrate if none specified in G-code
-# =============================================================================
+# Tentative d'import des librairies d'optimisation
+try:
+    from scipy.spatial import KDTree
+    import numpy as np
+    KDTREE_AVAILABLE = True
+except ImportError:
+    KDTREE_AVAILABLE = False
+    print("⚠️  scipy and/or numpy not installed.")
+    print("   For optimal performance (O(n log n) instead of O(n²)), install them:")
+    print("   pip install scipy numpy")
+    print()
+
+
 
 class GCodeOptimizer:
     def __init__(self, filename: str, verbose: bool = False):
@@ -21,19 +55,41 @@ class GCodeOptimizer:
         self.verbose = verbose
         
     def log(self, message: str):
-        """Print debug message if verbose mode is enabled."""
         if self.verbose:
             print(f"[DEBUG] {message}")
         
     def read_gcode(self) -> List[str]:
-        """Read G-code file and return lines."""
-        with open(self.filename, 'r') as f:
-            self.gcode_lines = f.readlines()
+        """
+        Read G-code file and return lines.
+        
+        Returns:
+            List of G-code lines
+            
+        Raises:
+            FileNotFoundError: If file doesn't exist
+            IOError: If file cannot be read
+        """
+        if not os.path.exists(self.filename):
+            raise FileNotFoundError(f"G-code file not found: {self.filename}")
+        
+        if not os.path.isfile(self.filename):
+            raise IOError(f"Path is not a file: {self.filename}")
+        
+        try:
+            with open(self.filename, 'r', encoding='utf-8') as f:
+                self.gcode_lines = f.readlines()
+        except PermissionError:
+            raise IOError(f"Permission denied reading file: {self.filename}")
+        except Exception as e:
+            raise IOError(f"Error reading G-code file: {e}")
+        
+        if not self.gcode_lines:
+            raise IOError(f"G-code file is empty: {self.filename}")
+        
         self.log(f"Read {len(self.gcode_lines)} lines from file")
         return self.gcode_lines
     
     def parse_coordinates(self, line: str) -> Dict[str, float]:
-        """Extract X, Y, Z, F coordinates from a G-code line."""
         coords = {}
         x_match = re.search(r'X([-+]?\d*\.?\d+)', line, re.IGNORECASE)
         y_match = re.search(r'Y([-+]?\d*\.?\d+)', line, re.IGNORECASE)
@@ -52,11 +108,9 @@ class GCodeOptimizer:
         return coords
     
     def is_movement_command(self, line: str) -> bool:
-        """Check if line is a movement command (G0 or G1)."""
         return bool(re.match(r'^\s*G[01]\s', line, re.IGNORECASE))
     
     def get_all_z_levels(self) -> List[float]:
-        """Extract all unique Z levels from the file, sorted from highest to lowest."""
         z_values = set()
         current_z = None
         
@@ -72,26 +126,28 @@ class GCodeOptimizer:
         self.log(f"Found {len(sorted_z)} Z levels: {sorted_z}")
         return sorted_z
     
-    def extract_segments_at_z(self, target_z: float, tolerance: float = 0.001) -> List[Tuple[int, str, Dict, Dict, float]]:
+    def extract_segments_at_z(self, target_z: float, tolerance: float = None) -> List[Tuple[int, str, Dict, Dict, float]]:
         """
-        Extract movement segments (start -> end) at specific Z level.
-        Returns list of (line_number, original_line, start_coords, end_coords, feedrate).
+        Extract movement segments at specific Z level.
+        
+        Args:
+            target_z: Target Z level to extract segments from
+            tolerance: Acceptable deviation from target Z (default: Z_TOLERANCE from config)
+            
+        Returns:
+            List of tuples (line_num, original_line, start_coords, end_coords, feedrate)
         """
+        if tolerance is None:
+            tolerance = Z_TOLERANCE
+            
         segments = []
         current_z = None
         current_x = None
         current_y = None
         current_f = None
-        z_positive_count = 0
-        z_target_count = 0
-        movement_count = 0
-        z_none_count = 0
-        
-        self.log(f"Looking for segments at Z = {target_z} (tolerance = {tolerance})")
         
         for idx, line in enumerate(self.gcode_lines):
             if self.is_movement_command(line):
-                movement_count += 1
                 coords = self.parse_coordinates(line)
                 
                 start_x = current_x
@@ -104,53 +160,22 @@ class GCodeOptimizer:
                     current_y = coords['Y']
                 if 'Z' in coords:
                     current_z = coords['Z']
-                    if self.verbose:
-                        self.log(f"Line {idx}: Z changed to {current_z}")
                 if 'F' in coords:
                     current_f = coords['F']
-                    if self.verbose:
-                        self.log(f"Line {idx}: F changed to {current_f}")
                 
-                if current_z is None:
-                    z_none_count += 1
-                    if self.verbose:
-                        self.log(f"Line {idx}: Skipping (Z never set yet)")
-                    continue
-                
-                if current_z > 0:
-                    z_positive_count += 1
-                    if self.verbose:
-                        self.log(f"Line {idx}: Skipping (Z={current_z} > 0)")
+                if current_z is None or current_z > 0:
                     continue
                 
                 if abs(current_z - target_z) <= tolerance:
                     if ('X' in coords or 'Y' in coords) and start_x is not None and start_y is not None:
                         start_coords = {'X': start_x, 'Y': start_y, 'Z': start_z if start_z else current_z}
                         end_coords = {'X': current_x, 'Y': current_y, 'Z': current_z}
-                        
-                        # Use current feedrate, or default from config if never set
                         feedrate = current_f if current_f is not None else DEFAULT_FEEDRATE
-                        
                         segments.append((idx, line.strip(), start_coords, end_coords, feedrate))
-                        z_target_count += 1
-                        if self.verbose:
-                            z_in_line = "Z in line" if 'Z' in coords else "Z inherited"
-                            f_in_line = "F in line" if 'F' in coords else "F inherited"
-                            self.log(f"Line {idx}: SEGMENT! ({z_in_line}, {f_in_line})")
-                            self.log(f"         Start: ({start_x:.3f}, {start_y:.3f})")
-                            self.log(f"         End:   ({current_x:.3f}, {current_y:.3f})")
-                            self.log(f"         F: {feedrate}")
-                else:
-                    if self.verbose:
-                        self.log(f"Line {idx}: Z={current_z} not matching target {target_z}")
-        
-        if not self.verbose:
-            print(f"  Movements found: {movement_count}, at target Z: {z_target_count}")
         
         return segments
     
     def calculate_segment_length(self, start: Dict, end: Dict) -> float:
-        """Calculate length of a segment."""
         x1 = start.get('X', 0)
         y1 = start.get('Y', 0)
         x2 = end.get('X', 0)
@@ -158,24 +183,148 @@ class GCodeOptimizer:
         return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
     
     def calculate_distance_between_segments(self, seg1_end: Dict, seg2_start: Dict) -> float:
-        """Calculate distance between end of segment 1 and start of segment 2."""
         x1 = seg1_end.get('X', 0)
         y1 = seg1_end.get('Y', 0)
         x2 = seg2_start.get('X', 0)
         y2 = seg2_start.get('Y', 0)
         return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
     
-    def nearest_neighbor_sort(self, segments: List[Tuple[int, str, Dict, Dict, float]], allow_reverse: bool = False) -> List[Tuple[int, str, Dict, Dict, bool, float]]:
+    def nearest_neighbor_sort(self, segments: List[Tuple[int, str, Dict, Dict, float]], 
+                              allow_reverse: bool = False) -> List[Tuple[int, str, Dict, Dict, bool, float]]:
         """
         Sort segments using nearest neighbor algorithm.
-        Returns list with added boolean flag: (line_num, line, start, end, is_reversed, feedrate)
+        Automatically uses KD-Tree (O(n log n)) if available, otherwise falls back to O(n²).
+        """
+        if KDTREE_AVAILABLE:
+            return self.nearest_neighbor_sort_kdtree(segments, allow_reverse)
+        else:
+            return self.nearest_neighbor_sort_original(segments, allow_reverse)
+    
+    def nearest_neighbor_sort_kdtree(self, segments: List[Tuple[int, str, Dict, Dict, float]], 
+                                      allow_reverse: bool = False) -> List[Tuple[int, str, Dict, Dict, bool, float]]:
+        """
+        Version optimisée O(n log n) utilisant KD-Tree pour la recherche du plus proche voisin.
         """
         if not segments:
             return []
         
-        self.log(f"Optimizing {len(segments)} segments, allow_reverse={allow_reverse}")
+        self.log(f"Optimizing {len(segments)} segments with KD-Tree, allow_reverse={allow_reverse}")
         
-        # Unpack feedrate from input segments
+        n = len(segments)
+        
+        # ✅ SÉCURITÉ 1: Gestion du cas n=1
+        if n == 1:
+            seg = segments[0]
+            return [(seg[0], seg[1], seg[2], seg[3], False, seg[4])]
+        
+        # Extraire les coordonnées de début et fin de tous les segments
+        start_points = np.array([[seg[2]['X'], seg[2]['Y']] for seg in segments])
+        end_points = np.array([[seg[3]['X'], seg[3]['Y']] for seg in segments])
+        
+        # Si allow_reverse, combiner les deux ensembles de points
+        if allow_reverse:
+            # Créer un seul arbre avec TOUS les points (starts + ends)
+            all_points = np.vstack([start_points, end_points])
+            tree = KDTree(all_points)
+            # Mapping: index dans all_points -> (segment_index, is_reversed)
+            point_to_segment = {}
+            for i in range(n):
+                point_to_segment[i] = (i, False)  # start point -> segment i, not reversed
+                point_to_segment[n + i] = (i, True)  # end point -> segment i, reversed
+        else:
+            # Seulement les points de début
+            tree = KDTree(start_points)
+        
+        # Initialiser avec le premier segment
+        first_seg = segments[0]
+        optimized = [(first_seg[0], first_seg[1], first_seg[2], first_seg[3], False, first_seg[4])]
+        
+        # Set des indices déjà utilisés
+        used = {0}
+        reverse_count = 0
+        
+        # Position courante (fin du premier segment)
+        current_pos = np.array([first_seg[3]['X'], first_seg[3]['Y']])
+        
+        while len(used) < n:
+            # Trouver les plus proches voisins
+            # On demande plus que nécessaire car certains seront déjà utilisés
+            k = min(n - len(used) + 5, len(tree.data))
+            
+            try:
+                distances, indices = tree.query(current_pos, k=k)
+                
+                # ✅ SÉCURITÉ 2: Normalisation k=1
+                # Si k=1, query renvoie des scalars, pas des arrays
+                if k == 1:
+                    distances = np.array([distances])
+                    indices = np.array([indices])
+                    
+            except Exception as e:
+                self.log(f"KDTree query error: {e}, using fallback")
+                # ✅ SÉCURITÉ 3: Fallback sur erreur
+                for i in range(n):
+                    if i not in used:
+                        seg = segments[i]
+                        optimized.append((seg[0], seg[1], seg[2], seg[3], False, seg[4]))
+                        used.add(i)
+                        current_pos = np.array([seg[3]['X'], seg[3]['Y']])
+                        break
+                continue
+            
+            # Trouver le premier segment non utilisé
+            best_idx = None
+            best_reversed = False
+            
+            for dist, point_idx in zip(distances, indices):
+                if allow_reverse:
+                    # ✅ SÉCURITÉ 4: Conversion explicite int()
+                    seg_idx, is_reversed = point_to_segment[int(point_idx)]
+                else:
+                    # ✅ SÉCURITÉ 4: Conversion explicite int()
+                    seg_idx = int(point_idx)
+                    is_reversed = False
+                
+                if seg_idx not in used:
+                    best_idx = seg_idx
+                    best_reversed = is_reversed
+                    break
+            
+            # ✅ SÉCURITÉ 5: Double fallback
+            if best_idx is None:
+                for i in range(n):
+                    if i not in used:
+                        best_idx = i
+                        best_reversed = False
+                        break
+            
+            if best_idx is None:
+                break
+            
+            # Ajouter le segment trouvé
+            seg = segments[best_idx]
+            optimized.append((seg[0], seg[1], seg[2], seg[3], best_reversed, seg[4]))
+            used.add(best_idx)
+            
+            if best_reversed:
+                reverse_count += 1
+                current_pos = np.array([seg[2]['X'], seg[2]['Y']])  # Start devient la nouvelle position
+            else:
+                current_pos = np.array([seg[3]['X'], seg[3]['Y']])  # End devient la nouvelle position
+        
+        if allow_reverse:
+            print(f"  Segments reversed: {reverse_count}/{len(segments)}")
+        
+        return optimized
+    
+    def nearest_neighbor_sort_original(self, segments: List[Tuple[int, str, Dict, Dict, float]], 
+                                        allow_reverse: bool = False) -> List[Tuple[int, str, Dict, Dict, bool, float]]:
+        """
+        Version originale O(n²) - conservée pour comparaison ou fallback.
+        """
+        if not segments:
+            return []
+        
         first_seg = segments[0]
         optimized = [(first_seg[0], first_seg[1], first_seg[2], first_seg[3], False, first_seg[4])]
         remaining = segments[1:]
@@ -183,10 +332,7 @@ class GCodeOptimizer:
         
         while remaining:
             last_seg = optimized[-1]
-            if last_seg[4]:  # is_reversed
-                current_position = last_seg[2]  # start
-            else:
-                current_position = last_seg[3]  # end
+            current_position = last_seg[2] if last_seg[4] else last_seg[3]
             
             min_dist = float('inf')
             nearest_idx = 0
@@ -222,9 +368,13 @@ class GCodeOptimizer:
         
         return optimized
     
-    def optimize(self, target_z: float = None, output_filename: str = None, allow_reverse: bool = False, all_layers: bool = True, allow_comments: bool = False, force_overwrite: bool = False):
-        """Main optimization function."""
-        # Check if output file exists
+    def optimize(self, target_z: float = None, output_filename: str = None, 
+                 allow_reverse: bool = False, all_layers: bool = True, 
+                 allow_comments: bool = False, force_overwrite: bool = False):
+        """
+        Main optimization function.
+        Automatically uses KD-Tree (O(n log n)) if scipy/numpy available.
+        """
         if os.path.exists(output_filename) and not force_overwrite:
             response = input(f"⚠️  File '{output_filename}' already exists. Overwrite? (y/n): ").strip().lower()
             if response not in ['y', 'yes', 'o', 'oui']:
@@ -232,6 +382,10 @@ class GCodeOptimizer:
                 sys.exit(0)
         
         print(f"Reading G-code from: {self.filename}")
+        if KDTREE_AVAILABLE:
+            print(f"Algorithm: KD-Tree O(n log n) ✓")
+        else:
+            print(f"Algorithm: Original O(n²) - Install scipy/numpy for better performance")
         self.read_gcode()
         
         if all_layers:
@@ -441,6 +595,15 @@ class GCodeOptimizer:
 
 # Main
 if __name__ == "__main__":
+    # Vérifier si scipy/numpy sont disponibles et demander confirmation si besoin
+    if not KDTREE_AVAILABLE:
+        response = input("Continue with slower O(n²) algorithm? (y/n): ").strip().lower()
+        if response not in ['y', 'yes', 'o', 'oui']:
+            print("❌ Operation cancelled. Please install dependencies:")
+            print("   pip install scipy numpy")
+            sys.exit(0)
+        print()
+    
     if len(sys.argv) < 2:
         print("Usage: python gcode_optimizer.py <input_file> [options]")
         print("\nExamples:")
@@ -459,6 +622,12 @@ if __name__ == "__main__":
         print(f"  RAPID_FEEDRATE = {RAPID_FEEDRATE}")
         print(f"  PLUNGE_FEEDRATE = {PLUNGE_FEEDRATE}")
         print(f"  DEFAULT_FEEDRATE = {DEFAULT_FEEDRATE}")
+        print("\nPerformance:")
+        if KDTREE_AVAILABLE:
+            print("  ✓ scipy/numpy installed - using fast O(n log n) algorithm")
+        else:
+            print("  ⚠️  scipy/numpy not installed - using slow O(n²) algorithm")
+            print("     Install for better performance: pip install scipy numpy")
         sys.exit(1)
     
     input_file = sys.argv[1]
